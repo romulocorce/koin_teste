@@ -1,4 +1,313 @@
-------------------------------------------------
--criar um volume "/Volumes/teste_koin/default/raw" e adicionar os arquivos .CSV
--caso seja nescessario ajuste os caminhos na pasta bronze_layer no campo "RAW_VOLUME"
+# koin_teste — Pipeline de Dados (Arquitetura Medallion)
 
+Pipeline de dados construído em **Databricks** com **PySpark** e **Delta Lake**, seguindo a arquitetura Medallion (Bronze → Silver → Gold). O objetivo é ingerir dados brutos de clientes e pedidos, aplicar qualidade de dados e mascaramento de PII na camada Silver, e gerar tabelas analíticas prontas para consumo na camada Gold.
+
+---
+
+## Arquitetura
+
+```
+CSVs (Volume Databricks)
+        │
+        ▼
+ ┌─────────────┐
+ │   BRONZE    │  Ingestão raw com timestamp
+ └─────────────┘
+        │
+        ▼
+ ┌─────────────┐
+ │   SILVER    │  Deduplicação, normalização, mascaramento de PII
+ └─────────────┘
+        │
+        ▼
+ ┌─────────────┐
+ │    GOLD     │  Tabelas analíticas agregadas
+ └─────────────┘
+```
+
+---
+
+## Estrutura do Projeto
+
+```
+koin_teste/
+├── bronze_layer/
+│   ├── bronze_customers.py       # Ingestão de clientes para o Bronze
+│   └── bronze_orders.py          # Ingestão de pedidos para o Bronze
+├── silver_layer/
+│   ├── silver_customers.py       # Limpeza e mascaramento de clientes
+│   └── silver_orders.py          # Limpeza e normalização de pedidos
+└── gold_layer/
+    ├── gold_customer_orders.py       # Tabela base: join pedidos + clientes
+    ├── gold_customer_metrics.py      # Métricas agregadas por cliente
+    ├── gold_order_status_metrics.py  # Métricas por status de pedido
+    ├── gold_monthly_revenue.py       # Receita mensal
+    └── gold_region_metrics.py        # Métricas por estado e cidade
+```
+
+---
+
+## 🥉 Camada Bronze
+
+Responsável pela **ingestão raw** dos arquivos CSV para o Delta Lake, sem nenhuma transformação de negócio — apenas o dado como veio na origem, acrescido de um timestamp de ingestão.
+
+### `bronze_customers.py`
+
+Lê o arquivo `BRA - Cientista de dados - Customers.csv` do Volume e salva em `teste_koin.default.bronze_customers`.
+
+**O que faz:**
+- Lê o CSV com `inferSchema=True`, separador `,` e encoding `UTF-8`
+- Adiciona a coluna `ingestion_timestamp` com `current_timestamp()`
+- Escreve no formato Delta em modo `append` com `mergeSchema=true` (tolerante a novas colunas)
+
+### `bronze_orders.py`
+
+Lê o arquivo `BRA - Cientista de dados - Orders.csv` e salva em `teste_koin.default.bronze_orders`.
+
+**O que faz:**
+- Mesma lógica de ingestão da função `ingest_to_bronze()`
+- Modo `append` com `mergeSchema=true`
+
+---
+
+## 🥈 Camada Silver
+
+Responsável pela **qualidade do dado**: deduplicação, normalização de tipos, mascaramento de dados sensíveis (PII) e escrita via `MERGE` no Delta (upsert idempotente).
+
+### `silver_customers.py`
+
+Processa a tabela `bronze_customers` e gera `silver_customers`.
+
+**O que faz, passo a passo:**
+
+| Etapa | Descrição |
+|---|---|
+| **Validação de colunas** | Verifica se todas as colunas obrigatórias existem; lança `ValueError` se alguma estiver faltando |
+| **Filtro de chave nula** | Remove registros onde `customer_id` é `NULL` |
+| **Deduplicação** | Mantém apenas o registro mais recente por `customer_id` (critério: `ingestion_date` DESC; em empate, prioriza status `"blocked"`) |
+| **Parsing de data** | Tenta múltiplos formatos com `try_to_date`: `yyyy-MM-dd` → `dd/MM/yyyy` → `yyyy/MM/dd` |
+| **Mascaramento de e-mail** | Mantém os 3 primeiros caracteres + domínio: `ana****@email.com` |
+| **Hash de e-mail** | SHA-256 do e-mail normalizado (lowercase + trim) para chave de join segura |
+| **Mascaramento de telefone** | Remove formatação e mantém apenas os 6 primeiros dígitos: `11987****` |
+| **Normalização de nome** | `initcap` + `trim` |
+| **Normalização de estado** | `UPPER` + `trim` |
+| **MERGE (upsert)** | Se a tabela Silver já existe: `MERGE` por `customer_id`; senão, cria com `overwrite` |
+
+**Colunas da tabela `silver_customers`:**
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `customer_id` | string | Chave primária |
+| `customer_cpf_hash` | string | Hash do CPF vindo do Bronze |
+| `customer_name` | string | Nome normalizado (initcap) |
+| `customer_email_hash` | string | SHA-256 do e-mail |
+| `customer_masked_email` | string | E-mail mascarado |
+| `customer_masked_phone` | string | Telefone mascarado |
+| `customer_city` | string | Cidade (trimada) |
+| `customer_state` | string | Estado (uppercase) |
+| `customer_status` | string | Status do cliente |
+| `customer_created_at_date` | date | Data de cadastro parseada |
+| `bronze_at` | timestamp | Timestamp de ingestão no Bronze |
+| `silver_at` | timestamp | Timestamp de processamento no Silver |
+
+---
+
+### `silver_orders.py`
+
+Processa a tabela `bronze_orders` e gera `silver_orders`.
+
+**O que faz, passo a passo:**
+
+| Etapa | Descrição |
+|---|---|
+| **Validação de colunas** | Verifica colunas obrigatórias (`order_id`, `customer_id`, `order_date`, `amount`, `payment_method`, `status`) |
+| **Filtro de chave nula** | Remove registros com `order_id` nulo |
+| **Deduplicação** | Mantém o registro mais recente por `order_id` (critério: `order_date` DESC) |
+| **Parsing de data** | Mesma lógica multi-formato do Silver Customers |
+| **Normalização de valor** | Detecta formato BR (vírgula como decimal, ponto como milhar) e converte para `decimal(15,2)` |
+| **MERGE (upsert)** | Mesmo padrão: MERGE se tabela existe, cria com overwrite se não existe |
+
+**Colunas da tabela `silver_orders`:**
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `order_id` | string | Chave primária |
+| `customer_id` | string | FK para clientes |
+| `order_amount` | decimal(15,2) | Valor do pedido normalizado |
+| `order_payment_method` | string | Método de pagamento |
+| `order_status` | string | Status do pedido |
+| `order_date` | date | Data do pedido parseada |
+| `bronze_at` | timestamp | Timestamp de ingestão no Bronze |
+| `silver_at` | timestamp | Timestamp de processamento no Silver |
+
+---
+
+## 🥇 Camada Gold
+
+Tabelas analíticas prontas para consumo por dashboards, times de negócio e Data Science. Todas são geradas a partir da tabela base `gold_orders_customers`.
+
+### `gold_customer_orders.py` — Tabela base
+
+Faz o **LEFT JOIN** entre `silver_orders` e `silver_customers` e gera `gold_orders_customers`.
+
+- Granularidade: **1 linha por pedido**
+- Preserva todos os pedidos (mesmo sem cliente correspondente, via LEFT JOIN)
+- Adiciona coluna `gold_at` com timestamp de geração
+- Escrita via **MERGE** por `order_id`
+
+---
+
+### `gold_customer_metrics.py` — Métricas por cliente
+
+Agrega `gold_orders_customers` por cliente e salva em `gold_customer_metrics`.
+
+| Coluna | Descrição |
+|---|---|
+| `total_orders` | Total de pedidos do cliente |
+| `total_spent` | Soma dos valores gastos |
+| `average_ticket` | Ticket médio |
+| `last_order_date` | Data do último pedido |
+| `first_order_date` | Data do primeiro pedido |
+
+---
+
+### `gold_order_status_metrics.py` — Métricas por status
+
+Agrega por `order_status` e salva em `gold_order_status_metrics`.
+
+| Coluna | Descrição |
+|---|---|
+| `total_orders` | Quantidade de pedidos por status |
+| `total_revenue` | Receita total por status |
+| `average_ticket` | Ticket médio por status |
+
+---
+
+### `gold_monthly_revenue.py` — Receita mensal
+
+Agrega por mês (`yyyy-MM`) e salva em `gold_monthly_revenue`, ordenado cronologicamente.
+
+| Coluna | Descrição |
+|---|---|
+| `year_month` | Mês de referência (ex: `2024-03`) |
+| `total_revenue` | Receita total do mês |
+| `average_ticket` | Ticket médio do mês |
+| `total_orders` | Total de pedidos no mês |
+
+---
+
+### `gold_region_metrics.py` — Métricas por região
+
+Agrega por `customer_state` e `customer_city`, ordenado por `total_revenue DESC`, e salva em `gold_region_metrics`.
+
+| Coluna | Descrição |
+|---|---|
+| `total_orders` | Total de pedidos na região |
+| `total_revenue` | Receita total da região |
+| `average_ticket` | Ticket médio da região |
+| `total_customers` | Clientes únicos na região |
+
+---
+
+## 🚀 Tutorial de Execução
+
+### Pré-requisitos
+
+- Conta no **Databricks** com um cluster ativo (DBR 13.x ou superior recomendado)
+- Permissão para criar catálogos e volumes no **Unity Catalog**
+- Arquivos CSV disponíveis:
+  - `BRA - Cientista de dados - Customers .csv`
+  - `BRA - Cientista de dados - Orders.csv`
+
+---
+
+### Passo 1 — Criar o catálogo e o schema
+
+No Databricks SQL Editor ou em um notebook, execute:
+
+```sql
+CREATE CATALOG IF NOT EXISTS teste_koin;
+CREATE SCHEMA IF NOT EXISTS teste_koin.default;
+```
+
+---
+
+### Passo 2 — Criar o Volume e fazer upload dos CSVs
+
+```sql
+CREATE VOLUME IF NOT EXISTS teste_koin.default.raw;
+```
+
+Depois, acesse **Catalog > teste_koin > default > raw** e faça o upload dos dois arquivos CSV pelo botão **"Upload to this volume"**.
+
+> Se precisar alterar o caminho do volume, ajuste a variável `RAW_VOLUME` nos arquivos da pasta `bronze_layer/`.
+
+---
+
+### Passo 3 — Importar os notebooks no Databricks
+
+1. No Databricks, acesse **Workspace**
+2. Clique em **Import** e suba os arquivos `.py` de cada camada
+3. Organize em pastas sugeridas: `bronze_layer/`, `silver_layer/`, `gold_layer/`
+
+---
+
+### Passo 4 — Executar na ordem correta
+
+Execute os notebooks **na sequência abaixo**. Cada camada depende da anterior.
+
+#### 🥉 Bronze (executar primeiro)
+```
+1. bronze_layer/bronze_customers.py
+2. bronze_layer/bronze_orders.py
+```
+
+#### 🥈 Silver (executar após o Bronze)
+```
+3. silver_layer/silver_customers.py
+4. silver_layer/silver_orders.py
+```
+
+#### 🥇 Gold (executar após o Silver)
+```
+5. gold_layer/gold_customer_orders.py   ← obrigatório primeiro na Gold
+6. gold_layer/gold_customer_metrics.py
+7. gold_layer/gold_order_status_metrics.py
+8. gold_layer/gold_monthly_revenue.py
+9. gold_layer/gold_region_metrics.py
+```
+
+> Os notebooks 6–9 da Gold dependem da tabela `gold_orders_customers`, portanto o notebook 5 deve ser executado antes deles.
+
+---
+
+### Passo 5 — Verificar os resultados
+
+```sql
+-- Bronze
+SELECT * FROM teste_koin.default.bronze_customers LIMIT 10;
+SELECT * FROM teste_koin.default.bronze_orders LIMIT 10;
+
+-- Silver
+SELECT * FROM teste_koin.default.silver_customers LIMIT 10;
+SELECT * FROM teste_koin.default.silver_orders LIMIT 10;
+
+-- Gold
+SELECT * FROM teste_koin.default.gold_orders_customers LIMIT 10;
+SELECT * FROM teste_koin.default.gold_customer_metrics LIMIT 10;
+SELECT * FROM teste_koin.default.gold_order_status_metrics;
+SELECT * FROM teste_koin.default.gold_monthly_revenue;
+SELECT * FROM teste_koin.default.gold_region_metrics LIMIT 10;
+```
+
+---
+
+## ⚠️ Observações e Limitações Conhecidas
+
+- **Ambiguidade de datas:** Formatos como `dd/MM/yyyy` e `MM/dd/yyyy` são ambíguos (ex: `05/06/2024` pode ser 5 de junho ou 6 de maio). O parsing tenta múltiplos formatos mas pode interpretar incorretamente. Recomenda-se validar o padrão de data na origem dos dados.
+
+- **bronze_orders.py — código legado:** O arquivo contém um primeiro bloco de código sem a função `ingest_to_bronze()` (versão inicial). Apenas o segundo bloco (refatorado) deve ser considerado o padrão.
+
+- **Mascaramento de PII:** E-mails, telefones e CPFs são mascarados/hasheados na camada Silver. Os dados brutos só existem na camada Bronze, que deve ter acesso restrito.
+
+- **Reexecução:** As camadas Bronze usam `mode("append")`, portanto reexecutar o notebook adicionará duplicatas no Bronze. O Silver trata isso via deduplicação. As camadas Gold usam `mode("overwrite")`, sendo seguras para reexecução.
